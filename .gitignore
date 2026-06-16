@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Agent run artifacts (keep the folders, ignore their contents)
+screenshots/*
+!screenshots/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

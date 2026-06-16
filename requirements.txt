@@ -1,0 +1,8 @@
+# Core dependencies for the Gemini-powered vision web-automation agent.
+#
+# Install with:   pip install -r requirements.txt
+# Then run:       playwright install chromium
+
+google-genai>=1.0.0     # Google Gemini SDK (vision + function calling)
+playwright>=1.40.0      # Browser automation (Chromium)
+python-dotenv>=1.0.0    # Loads GEMINI_API_KEY and settings from .env
