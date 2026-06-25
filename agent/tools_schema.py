@@ -110,6 +110,17 @@ FUNCTION_DECLARATIONS = [
         },
     },
     {
+        "name": "verify_form",
+        "description": (
+            "Read the ACTUAL current values of the form fields straight from the "
+            "page (ground truth — not a guess from the screenshot). Returns each "
+            "field's label and the text it currently contains. ALWAYS call this "
+            "right before report_task_complete: if any field you were asked to "
+            "fill is empty or wrong, click its CENTER and re-type, then verify "
+            "again. Only report complete once verify_form shows the correct text."
+        ),
+    },
+    {
         "name": "report_task_complete",
         "description": (
             "Call this once the task is fully finished and you have visually "
@@ -149,13 +160,20 @@ def build_system_prompt(width: int, height: int) -> str:
         "need is not on screen, use the `scroll` tool and then look again.\n\n"
         "To fill a text field:\n"
         "  1. Locate the field in the latest screenshot.\n"
-        "  2. `click_on_screen` at its center to focus it.\n"
-        "  3. `send_keys` with the text (use clear_first=true if it already has text).\n"
+        "  2. `click_on_screen` at the VISUAL CENTER of the input box itself — for a "
+        "multi-line text area click the middle of the box, NOT on its label or the "
+        "gap just below the label, or the click will miss and focus nothing.\n"
+        "  3. `send_keys` with the text (use clear_first=true if it already has text). "
+        "If send_keys reports that no field is focused, your click missed — click the "
+        "box center again, then retype.\n"
         "  4. Check the next screenshot to confirm the text landed in the RIGHT field.\n\n"
         "Work one step at a time, calling exactly one tool per turn. After every "
         "action you receive a new screenshot showing the result — use it to verify "
-        "before moving on, and never repeat an action that already succeeded. When "
-        "the whole task is done and verified, call `report_task_complete`."
+        "before moving on, and never repeat an action that already succeeded.\n\n"
+        "Do NOT trust the screenshot alone to declare success: before finishing, call "
+        "`verify_form` to read the fields' real values from the page. Only when "
+        "verify_form shows every required field holds the correct text may you call "
+        "`report_task_complete`."
     )
 
 
@@ -170,6 +188,11 @@ def build_task_prompt(url: str, name_value: str, description_value: str) -> str:
         "visible area, so scroll down if you do not see the Name/Description "
         "fields. Some pages render the form inside a preview frame; clicking by "
         "coordinates still works there.\n\n"
-        "Once both fields contain the correct text (verify it in a screenshot), "
-        "call report_task_complete with a short summary."
+        "Note: the field labels on the page may not be literally 'Name'/'Description' "
+        "(for example a 'Bug Title' field plays the role of the Name field) — map the "
+        "requested values to the most appropriate single-line text input and the "
+        "multi-line text area.\n\n"
+        "Once both fields look filled, call `verify_form` to confirm their real values "
+        "from the page; fix any that are empty or wrong, then call "
+        "report_task_complete with a short summary."
     )

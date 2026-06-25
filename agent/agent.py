@@ -17,6 +17,7 @@ fresh screenshot in between.)
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from logging import Logger
 
@@ -214,10 +215,25 @@ class WebAutomationAgent:
         args = dict(function_call.args or {})
         self.log.info("→ tool: %s %s", name, args)
 
-        # report_task_complete ends the run and carries no screenshot.
+        # report_task_complete ends the run and carries no screenshot — but only
+        # if the page really contains the expected values. We re-check the DOM
+        # here so the model cannot end on a hallucinated "success".
         if name == "report_task_complete":
+            claimed = bool(args.get("success", False))
+            if claimed:
+                ok, detail, screenshot = self._verify_expected_values()
+                if not ok:
+                    self.log.warning("report_task_complete REJECTED: %s", detail)
+                    return (
+                        "NOT complete. A direct read of the page shows: " + detail
+                        + " Click the correct field at its visual CENTER, type the "
+                        "missing text, call verify_form, and only then report complete.",
+                        screenshot,
+                        False,
+                        None,
+                    )
             outcome = RunResult(
-                success=bool(args.get("success", False)),
+                success=claimed,
                 summary=str(args.get("summary", "")),
                 steps_taken=0,
             )
@@ -243,6 +259,12 @@ class WebAutomationAgent:
             _, png = self.controller.take_screenshot("requested")
             return "Screenshot captured.", png
 
+        if name == "verify_form":
+            fields = self.controller.read_fields()
+            _, png = self.controller.take_screenshot("verify_form")
+            body = json.dumps(fields, ensure_ascii=False, indent=2)
+            return f"Current field values read from the page:\n{body}", png
+
         if name == "navigate_to_url":
             text = self.controller.navigate_to_url(args["url"])
         elif name == "click_on_screen":
@@ -266,6 +288,38 @@ class WebAutomationAgent:
         # Every interaction returns a fresh screenshot so the model sees the result.
         _, png = self.controller.take_screenshot(name)
         return text, png
+
+    def _verify_expected_values(self):
+        """Confirm the configured Name/Description text is actually on the page.
+
+        Reads the live field values from the DOM and checks that each expected
+        value appears in some field. Label-agnostic on purpose: the page may call
+        the field "Bug Title" rather than "Name", so we match on the *value* the
+        user asked us to type, not on the label.
+
+        Returns ``(ok, detail, screenshot_bytes_or_None)``.
+        """
+        fields = self.controller.read_fields()
+        values = [str(f.get("value", "")) for f in fields]
+        missing = []
+        for label, expected in (
+            ("Name", self.config.name_value),
+            ("Description", self.config.description_value),
+        ):
+            exp = (expected or "").strip()
+            if exp and not any(exp in v for v in values):
+                shown = exp if len(exp) <= 40 else exp[:40] + "…"
+                missing.append(f'the {label} value "{shown}"')
+
+        screenshot = None
+        try:
+            _, screenshot = self.controller.take_screenshot("verify_complete")
+        except Exception:
+            pass
+
+        if missing:
+            return False, "no field contains " + "; ".join(missing) + ".", screenshot
+        return True, "all expected values are present.", screenshot
 
     # ------------------------------------------------------------------ #
     # Small helpers

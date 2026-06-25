@@ -55,7 +55,10 @@ All implemented in [`agent/browser_tools.py`](agent/browser_tools.py):
 | `send_keys`        | `BrowserController.send_keys`       | ✅ `send_keys`               |
 | `scroll`           | `BrowserController.scroll`          | ✅ `scroll`                  |
 
-Plus a `report_task_complete` tool so the agent can signal it is done.
+Plus two agent-control tools: `verify_form` (reads the fields' real values from
+the DOM so the agent confirms — not guesses — what it typed) and
+`report_task_complete` (signals the run is done, and is only accepted if the live
+page actually contains the requested values).
 
 ---
 

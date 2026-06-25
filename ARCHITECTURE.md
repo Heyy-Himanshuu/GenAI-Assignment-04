@@ -66,8 +66,11 @@ which improves tool-selection accuracy.
 
 ```
 take_screenshot   navigate_to_url   click_on_screen   double_click
-send_keys         scroll            report_task_complete
+send_keys         scroll            verify_form       report_task_complete
 ```
+
+`verify_form` reads the form fields' real values from the DOM (ground truth), so
+the agent confirms what it actually typed instead of trusting the screenshot.
 
 `open_browser` is a controller capability invoked by the harness at startup (you
 cannot screenshot a page before a browser exists), so it is not exposed as a
@@ -141,9 +144,29 @@ click. The agent demonstrates decision-making by:
 
 - scrolling when the target is not in the current viewport,
 - focusing a field before typing,
+- mapping the requested fields onto the page's real labels (e.g. the demo form's
+  "Bug Title" input plays the role of the "Name" field),
 - verifying via the post-action screenshot that text landed in the right field,
+- confirming the result against DOM ground truth with `verify_form` before
+  finishing — and re-typing any field that did not take,
 - recovering from errors (a failed tool returns an error message + screenshot so
   the model can re-plan instead of crashing).
+
+### Guarding against silent failure and false success
+
+Two safeguards make the run trustworthy:
+
+1. **Focus guard.** `send_keys` refuses to type (or select-all-clear) unless a
+   real input/textarea is focused. If a click misses its target, focus is on the
+   page body — without this guard, `clear_first` would `Cmd/Ctrl+A` the *whole
+   document* and the text would be lost. Instead the tool returns an error and the
+   model re-clicks. (This is exactly the failure mode an early test hit: a click
+   landed just above the textarea and the description silently went nowhere.)
+2. **Completion check.** `report_task_complete` is not taken at face value — the
+   agent re-reads the live field values and confirms the configured Name and
+   Description text is actually present. If not, completion is rejected and the
+   model is told to fix the missing field. The model cannot end on a hallucinated
+   success.
 
 ---
 
@@ -194,5 +217,3 @@ values to type, step limit) out of the code.
   stay within free-tier limits).
 - **DOM-assisted hybrid mode**: feed the accessibility tree alongside the image
   for tasks where text labels are more reliable than pixels.
-- **Self-verification step**: read the field values back via the DOM and confirm
-  they match the requested text before reporting success.

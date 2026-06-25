@@ -166,6 +166,16 @@ class BrowserController:
                 content in the field is replaced rather than appended.
         """
         self._require_page()
+        # Guard: typing (or a select-all clear) only makes sense when a text field
+        # is actually focused. If the previous click missed its target, the focus
+        # is on the page body — typing would be lost and ``clear_first`` would
+        # Cmd+A the WHOLE document. Refuse and tell the model to click first, so it
+        # re-plans instead of silently filling nothing.
+        if (text or clear_first) and not self.focused_editable():
+            raise BrowserError(
+                "No editable field is focused — your last click probably missed. "
+                "Click the input/textarea (its visual CENTER) first, then send_keys."
+            )
         if clear_first:
             select_all = "Meta+A" if sys.platform == "darwin" else "Control+A"
             self.page.keyboard.press(select_all)
@@ -197,6 +207,81 @@ class BrowserController:
         self.page.mouse.wheel(0, delta)
         self._settle()
         return f"Scrolled {direction} by {amount}px"
+
+    # ------------------------------------------------------------------ #
+    # Verification (DOM ground truth)
+    # ------------------------------------------------------------------ #
+    def focused_editable(self) -> str:
+        """Return the focused element's tag if it is editable, else ``""``.
+
+        Walks into same-origin iframes so it also works when the form is rendered
+        inside a component-preview frame. Used to verify a click actually landed
+        in a text field before we type.
+        """
+        self._require_page()
+        js = """() => {
+            function deepActive(doc) {
+                let el = doc.activeElement;
+                while (el && el.tagName === 'IFRAME') {
+                    try {
+                        const inner = el.contentDocument;
+                        if (!inner) break;
+                        doc = inner; el = doc.activeElement;
+                    } catch (e) { return null; }   // cross-origin: give up
+                }
+                return el;
+            }
+            const el = deepActive(document);
+            if (!el) return '';
+            const tag = (el.tagName || '').toLowerCase();
+            if (tag === 'input' || tag === 'textarea') return tag;
+            if (el.isContentEditable) return 'contenteditable';
+            return '';
+        }"""
+        try:
+            return self.page.evaluate(js) or ""
+        except Exception:
+            return ""
+
+    def read_fields(self) -> list[dict]:
+        """Read every visible input/textarea's label + current value from the DOM.
+
+        This is *ground truth* — what the page actually contains — as opposed to
+        the model's guess from a screenshot. It is how the agent confirms it really
+        filled the form before declaring success.
+        """
+        self._require_page()
+        js = """() => {
+            const out = [];
+            const docs = [document];
+            document.querySelectorAll('iframe').forEach(f => {
+                try { if (f.contentDocument) docs.push(f.contentDocument); } catch (e) {}
+            });
+            for (const doc of docs) {
+                doc.querySelectorAll('input, textarea').forEach(el => {
+                    if (el.type === 'hidden' || el.offsetParent === null) return;
+                    let label = '';
+                    if (el.id) {
+                        const l = doc.querySelector('label[for="' + el.id + '"]');
+                        if (l) label = l.innerText;
+                    }
+                    if (!label && el.getAttribute('aria-label')) label = el.getAttribute('aria-label');
+                    if (!label) { const w = el.closest('label'); if (w) label = w.innerText; }
+                    if (!label && el.placeholder) label = '(placeholder) ' + el.placeholder;
+                    out.push({
+                        label: (label || '').trim().slice(0, 60),
+                        value: el.value || '',
+                        tag: (el.tagName || '').toLowerCase(),
+                    });
+                });
+            }
+            return out;
+        }"""
+        try:
+            return self.page.evaluate(js) or []
+        except Exception as exc:
+            self.log.warning("read_fields failed: %s", exc)
+            return []
 
     # ------------------------------------------------------------------ #
     # Internals
