@@ -28,6 +28,7 @@ from google.genai import types
 from agent.browser_tools import BrowserController, BrowserError
 from agent.tools_schema import (
     FUNCTION_DECLARATIONS,
+    build_generic_task_prompt,
     build_system_prompt,
     build_task_prompt,
 )
@@ -50,14 +51,18 @@ class WebAutomationAgent:
     """Drives a browser to complete a task using Gemini's vision + function calling."""
 
     def __init__(self, config: Config, logger: Logger) -> None:
-        if not config.api_key:
+        if not config.api_keys:
             raise ValueError(
-                "GEMINI_API_KEY is not set. Add it to your .env file or "
+                "No Gemini API key is set. Add GEMINI_API_KEY to your .env file or "
                 "environment before running the agent."
             )
         self.config = config
         self.log = logger
-        self.client = genai.Client(api_key=config.api_key)
+        # Rotation pool: start on the first key, advance to the next on a quota
+        # (429) or denied (403) error so a single exhausted key doesn't stop a run.
+        self.api_keys = config.api_keys
+        self._key_index = 0
+        self.client = genai.Client(api_key=self.api_keys[0])
         self.tool = types.Tool(function_declarations=FUNCTION_DECLARATIONS)
         self.controller = BrowserController(config, logger)
         self.system_prompt = build_system_prompt(
@@ -75,19 +80,25 @@ class WebAutomationAgent:
             self.controller.navigate_to_url(self.config.target_url)
             _, screenshot = self.controller.take_screenshot("initial")
 
+            # Free-form mode (a user task is set) vs the built-in form-fill demo.
+            if self.config.task:
+                task_text = build_generic_task_prompt(
+                    self.config.task, self.config.target_url
+                )
+            else:
+                task_text = build_task_prompt(
+                    self.config.target_url,
+                    self.config.name_value,
+                    self.config.description_value,
+                )
+
             # The conversation history (list of types.Content). It starts with the
             # task description and the first screenshot.
             contents: list[types.Content] = [
                 types.Content(
                     role="user",
                     parts=[
-                        types.Part.from_text(
-                            text=build_task_prompt(
-                                self.config.target_url,
-                                self.config.name_value,
-                                self.config.description_value,
-                            )
-                        ),
+                        types.Part.from_text(text=task_text),
                         types.Part.from_bytes(data=screenshot, mime_type="image/png"),
                     ],
                 )
@@ -196,11 +207,38 @@ class WebAutomationAgent:
                 thinking_budget=(-1 if self.config.enable_thinking else 0),
             )
 
-        return self.client.models.generate_content(
-            model=self.config.model,
-            contents=contents,
-            config=types.GenerateContentConfig(**cfg_kwargs),
-        )
+        cfg = types.GenerateContentConfig(**cfg_kwargs)
+        # Try the current key; on quota (429) / denied (403), rotate to the next
+        # key and retry the same request. Other errors propagate immediately.
+        while True:
+            try:
+                return self.client.models.generate_content(
+                    model=self.config.model, contents=contents, config=cfg
+                )
+            except genai_errors.APIError as exc:
+                code = getattr(exc, "code", None)
+                if code in (429, 403):
+                    self.log.warning(
+                        "API key #%d/%d failed (HTTP %s): %s",
+                        self._key_index + 1, len(self.api_keys), code,
+                        getattr(exc, "message", str(exc)),
+                    )
+                    if self._rotate_key():
+                        self.log.info(
+                            "Rotated to API key #%d/%d — retrying.",
+                            self._key_index + 1, len(self.api_keys),
+                        )
+                        continue
+                    self.log.error("All %d API keys exhausted.", len(self.api_keys))
+                raise
+
+    def _rotate_key(self) -> bool:
+        """Switch the client to the next API key. Returns False if none remain."""
+        if self._key_index + 1 >= len(self.api_keys):
+            return False
+        self._key_index += 1
+        self.client = genai.Client(api_key=self.api_keys[self._key_index])
+        return True
 
     # ------------------------------------------------------------------ #
     # Tool execution
@@ -220,7 +258,10 @@ class WebAutomationAgent:
         # here so the model cannot end on a hallucinated "success".
         if name == "report_task_complete":
             claimed = bool(args.get("success", False))
-            if claimed:
+            # The DOM value check only applies to the built-in form-fill demo,
+            # where we know exactly what text should be on the page. In free-form
+            # mode there is no fixed expected value, so trust the model's report.
+            if claimed and not self.config.task:
                 ok, detail, screenshot = self._verify_expected_values()
                 if not ok:
                     self.log.warning("report_task_complete REJECTED: %s", detail)

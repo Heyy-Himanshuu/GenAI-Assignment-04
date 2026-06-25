@@ -25,9 +25,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Gemini-powered vision agent that fills a web form with Playwright."
     )
-    parser.add_argument("--url", help="Target URL to automate.")
-    parser.add_argument("--name", help="Value to type into the Name field.")
-    parser.add_argument("--description", help="Value to type into the Description field.")
+    parser.add_argument(
+        "--task",
+        help="Free-form instruction for the agent, e.g. "
+        '"open youtube, search fifa world cup, click the second video". '
+        "If omitted, you are prompted for one (press Enter for the form-fill demo).",
+    )
+    parser.add_argument("--url", help="Starting URL to open before the task.")
+    parser.add_argument("--name", help="Value to type into the Name field (demo mode).")
+    parser.add_argument("--description", help="Value to type into the Description field (demo mode).")
     parser.add_argument("--model", help="Gemini model id (default gemini-2.5-flash).")
     parser.add_argument("--max-steps", type=int, help="Safety cap on agent iterations.")
     parser.add_argument("--headless", dest="headless", action="store_true",
@@ -40,6 +46,31 @@ def parse_args() -> argparse.Namespace:
                         help="Logging verbosity (default INFO).")
     parser.set_defaults(headless=None, thinking=None)
     return parser.parse_args()
+
+
+def resolve_task(args: argparse.Namespace, config) -> None:
+    """Decide whether to run a free-form task or the built-in form-fill demo.
+
+    Priority: an explicit ``--task`` (or ``TASK`` env var) wins; otherwise, when
+    running interactively, prompt the user. An empty answer means "run the demo".
+    """
+    if args.task is not None:
+        config.task = args.task.strip() or None
+    elif config.task is None and sys.stdin.isatty():
+        try:
+            answer = input(
+                "\nWhat should the agent do?\n"
+                "  • Type a task, e.g. 'open youtube, search fifa world cup, click the second video'\n"
+                "  • Or press Enter to run the default form-filling demo.\n> "
+            ).strip()
+        except EOFError:
+            answer = ""
+        config.task = answer or None
+
+    # In free-form mode, start from a neutral launch page unless the user gave a
+    # specific --url; the agent navigates onward itself.
+    if config.task and args.url is None:
+        config.target_url = "https://www.google.com"
 
 
 def main() -> int:
@@ -64,12 +95,20 @@ def main() -> int:
     if args.log_level is not None:
         config.log_level = args.log_level
 
+    resolve_task(args, config)
+
     logger = setup_logger(config.logs_dir, config.log_level)
     logger.info("Starting web-automation agent")
-    logger.info("Target : %s", config.target_url)
     logger.info("Model  : %s (thinking=%s)", config.model, config.enable_thinking)
-    logger.info('Name   : "%s"', config.name_value)
-    logger.info('Desc.  : "%s"', config.description_value)
+    logger.info("Keys   : %d loaded (auto-rotate on quota/denied)", len(config.api_keys))
+    logger.info("Start  : %s", config.target_url)
+    if config.task:
+        logger.info("Mode   : free-form task")
+        logger.info('Task   : "%s"', config.task)
+    else:
+        logger.info("Mode   : form-fill demo")
+        logger.info('Name   : "%s"', config.name_value)
+        logger.info('Desc.  : "%s"', config.description_value)
 
     if not config.api_key:
         logger.error("GEMINI_API_KEY is not set. Copy .env.example to .env and add your key.")

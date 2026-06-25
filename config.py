@@ -30,12 +30,19 @@ class Config:
     """Runtime configuration for a single agent run."""
 
     # --- Gemini / model ---
+    # api_key is the first/primary key (kept for back-compat and the startup
+    # check); api_keys is the full rotation pool used on quota errors.
     api_key: str | None
+    api_keys: list[str]
     model: str
     enable_thinking: bool
     max_output_tokens: int
 
     # --- The task to perform ---
+    # When `task` is set, the agent runs in free-form mode: it pursues this
+    # natural-language instruction. When it is None, it runs the built-in
+    # form-filling demo (name_value / description_value on target_url).
+    task: str | None
     target_url: str
     name_value: str
     description_value: str
@@ -54,15 +61,45 @@ class Config:
     log_level: str
 
 
+def _collect_api_keys() -> list[str]:
+    """Gather every configured Gemini key into an ordered, de-duplicated list.
+
+    Reads GEMINI_API_KEY, GEMINI_API_KEY_2..5, a comma-separated GEMINI_API_KEYS,
+    and GOOGLE_API_KEY. The agent tries them in order, rotating to the next one
+    when a key hits its quota (HTTP 429) or is denied (403). The unedited
+    ``AIza...`` placeholder from .env.example is ignored.
+    """
+    candidates: list[str] = []
+    for name in (
+        "GEMINI_API_KEY",
+        "GEMINI_API_KEY_2",
+        "GEMINI_API_KEY_3",
+        "GEMINI_API_KEY_4",
+        "GEMINI_API_KEY_5",
+    ):
+        candidates.append(os.getenv(name) or "")
+    candidates.extend((os.getenv("GEMINI_API_KEYS") or "").split(","))
+    candidates.append(os.getenv("GOOGLE_API_KEY") or "")
+
+    keys: list[str] = []
+    for raw in candidates:
+        key = raw.strip()
+        if key and key != "AIza..." and key not in keys:
+            keys.append(key)
+    return keys
+
+
 def load_config() -> Config:
     """Build a :class:`Config` from environment variables (with defaults)."""
+    api_keys = _collect_api_keys()
     return Config(
-        # GEMINI_API_KEY is preferred; GOOGLE_API_KEY is accepted as a fallback
-        # because the google-genai SDK also recognises it.
-        api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"),
+        # First key is primary; the rest are fallbacks used on quota/denied errors.
+        api_key=api_keys[0] if api_keys else None,
+        api_keys=api_keys,
         model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         enable_thinking=_get_bool("ENABLE_THINKING", True),
         max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "8192")),
+        task=os.getenv("TASK") or None,
         target_url=os.getenv(
             "TARGET_URL", "https://ui.shadcn.com/docs/forms/react-hook-form"
         ),

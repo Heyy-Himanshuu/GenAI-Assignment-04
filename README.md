@@ -96,23 +96,43 @@ Everything else in `.env` is optional (it has defaults).
 ## Running
 
 ```bash
-# Run the default task (fills the shadcn form, visible browser window)
 python main.py
+```
+
+On launch it **asks what you want it to do**. You can either:
+
+- **Type a free-form task** and it will carry it out autonomously, e.g.
+  `open youtube, search fifa world cup, click the second video`
+- **Press Enter** to run the built-in **form-filling demo** (the assignment's
+  target task on the shadcn page).
+
+You can also give the task up front instead of being prompted:
+
+```bash
+# Free-form task (the agent navigates wherever it needs)
+python main.py --task "open youtube, search fifa world cup, click the second video"
+
+# Start the task on a specific page
+python main.py --task "find the pricing page and screenshot it" --url https://playwright.dev
+
+# The form-fill demo with custom values
+python main.py --name "Ada Lovelace" --description "Wrote the first algorithm."
 ```
 
 Useful flags (all optional; they override `.env`):
 
 ```bash
-python main.py --name "Ada Lovelace" \
-               --description "Wrote the first algorithm." \
-               --url https://ui.shadcn.com/docs/forms/react-hook-form
-
 python main.py --headless              # no visible window
 python main.py --no-thinking           # disable Gemini 2.5 thinking (faster)
 python main.py --model gemini-2.0-flash  # use a different free model
 python main.py --max-steps 40          # raise the safety step limit
 python main.py --log-level DEBUG       # verbose logging (incl. token usage)
 ```
+
+> In free-form mode the agent decides every step from what it sees, so results
+> vary with the site (cookie popups, layout changes). Complex tasks may need a
+> higher `--max-steps`. The DOM value-check only guards the form demo; free-form
+> runs end when the model judges the task visually complete.
 
 While it runs you will see, both on screen and in `logs/agent_<timestamp>.log`:
 - the model's summarized **thinking** and any text,
