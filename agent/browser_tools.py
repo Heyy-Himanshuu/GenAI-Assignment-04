@@ -116,7 +116,7 @@ class BrowserController:
 
         Returns a ``(file_path, png_bytes)`` tuple. The PNG is saved to disk
         (for the audit trail) and the raw bytes are returned so the caller can
-        hand them to the model (Gemini accepts image bytes directly).
+        base64-encode them into a Claude image block.
         """
         self._require_page()
         self._shot_index += 1

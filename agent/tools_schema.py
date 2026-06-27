@@ -1,15 +1,18 @@
-"""Function declarations and prompts shared with the Gemini model.
+"""Tool definitions and prompts shared with the Claude model.
 
-The declarations below are what the model "sees". Each maps 1:1 to a method on
-:class:`~agent.browser_tools.BrowserController`. They use Gemini's function-
-calling schema (OpenAPI subset with UPPERCASE type names), and descriptions are
-written to be *prescriptive about when to call the tool*, which improves tool
-selection.
+The definitions below are what the model "sees". Each maps 1:1 to a method on
+:class:`~agent.browser_tools.BrowserController`. They use Anthropic's tool-use
+schema — a ``name``, a ``description``, and a JSON Schema ``input_schema`` — and
+descriptions are written to be *prescriptive about when to call the tool*, which
+improves tool selection (recent Claude models reach for tools conservatively, so
+a clear "call this when…" trigger in the description gives measurable lift).
 """
 from __future__ import annotations
 
-# Gemini function declarations (passed to ``types.Tool(function_declarations=...)``).
-# A declaration with no "parameters" key is a no-argument function.
+# Anthropic tool definitions (passed straight to ``client.messages.create(tools=...)``).
+# A no-argument tool still needs an object input_schema with empty properties.
+_NO_ARGS = {"type": "object", "properties": {}}
+
 FUNCTION_DECLARATIONS = [
     {
         "name": "take_screenshot",
@@ -18,6 +21,7 @@ FUNCTION_DECLARATIONS = [
             "normally do not need this, because every other tool already returns "
             "a screenshot of its result."
         ),
+        "input_schema": _NO_ARGS,
     },
     {
         "name": "navigate_to_url",
@@ -25,10 +29,10 @@ FUNCTION_DECLARATIONS = [
             "Load a different web page. Use only if you need to leave the current "
             "page; the target page is already open when the task begins."
         ),
-        "parameters": {
-            "type": "OBJECT",
+        "input_schema": {
+            "type": "object",
             "properties": {
-                "url": {"type": "STRING", "description": "Absolute URL to open."}
+                "url": {"type": "string", "description": "Absolute URL to open."}
             },
             "required": ["url"],
         },
@@ -40,11 +44,11 @@ FUNCTION_DECLARATIONS = [
             "top-left of the latest screenshot. Use this to focus a text field "
             "before typing, or to press a button. Click the CENTER of the target."
         ),
-        "parameters": {
-            "type": "OBJECT",
+        "input_schema": {
+            "type": "object",
             "properties": {
-                "x": {"type": "INTEGER", "description": "Horizontal pixel (0 = left edge)."},
-                "y": {"type": "INTEGER", "description": "Vertical pixel (0 = top edge)."},
+                "x": {"type": "integer", "description": "Horizontal pixel (0 = left edge)."},
+                "y": {"type": "integer", "description": "Vertical pixel (0 = top edge)."},
             },
             "required": ["x", "y"],
         },
@@ -55,11 +59,11 @@ FUNCTION_DECLARATIONS = [
             "Double-click at pixel coordinates (x, y). Useful to select a word, "
             "or to activate controls that require a double-click."
         ),
-        "parameters": {
-            "type": "OBJECT",
+        "input_schema": {
+            "type": "object",
             "properties": {
-                "x": {"type": "INTEGER", "description": "Horizontal pixel."},
-                "y": {"type": "INTEGER", "description": "Vertical pixel."},
+                "x": {"type": "integer", "description": "Horizontal pixel."},
+                "y": {"type": "integer", "description": "Vertical pixel."},
             },
             "required": ["x", "y"],
         },
@@ -72,16 +76,16 @@ FUNCTION_DECLARATIONS = [
             "text. Set clear_first=true to replace any text already in the field. "
             "Use 'press' for a single key such as 'Enter' or 'Tab'."
         ),
-        "parameters": {
-            "type": "OBJECT",
+        "input_schema": {
+            "type": "object",
             "properties": {
-                "text": {"type": "STRING", "description": "Literal text to type."},
+                "text": {"type": "string", "description": "Literal text to type."},
                 "press": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "A single key to press instead of typing, e.g. 'Enter', 'Tab'.",
                 },
                 "clear_first": {
-                    "type": "BOOLEAN",
+                    "type": "boolean",
                     "description": "Select-all and delete before typing (default false).",
                 },
             },
@@ -94,16 +98,16 @@ FUNCTION_DECLARATIONS = [
             "Use this when the field or button you need is not visible in the "
             "current screenshot."
         ),
-        "parameters": {
-            "type": "OBJECT",
+        "input_schema": {
+            "type": "object",
             "properties": {
                 "direction": {
-                    "type": "STRING",
+                    "type": "string",
                     "enum": ["up", "down"],
                     "description": "Scroll direction (default 'down').",
                 },
                 "amount": {
-                    "type": "INTEGER",
+                    "type": "integer",
                     "description": "Pixels to scroll (default 400).",
                 },
             },
@@ -119,6 +123,7 @@ FUNCTION_DECLARATIONS = [
             "fill is empty or wrong, click its CENTER and re-type, then verify "
             "again. Only report complete once verify_form shows the correct text."
         ),
+        "input_schema": _NO_ARGS,
     },
     {
         "name": "report_task_complete",
@@ -126,15 +131,15 @@ FUNCTION_DECLARATIONS = [
             "Call this once the task is fully finished and you have visually "
             "confirmed it in a screenshot. This ends the run."
         ),
-        "parameters": {
-            "type": "OBJECT",
+        "input_schema": {
+            "type": "object",
             "properties": {
                 "success": {
-                    "type": "BOOLEAN",
+                    "type": "boolean",
                     "description": "True if the task was completed successfully.",
                 },
                 "summary": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "One or two sentences describing what you did.",
                 },
             },

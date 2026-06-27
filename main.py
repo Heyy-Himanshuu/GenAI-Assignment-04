@@ -23,7 +23,7 @@ from config import load_config
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Gemini-powered vision agent that fills a web form with Playwright."
+        description="Claude-powered vision agent that fills a web form with Playwright."
     )
     parser.add_argument(
         "--task",
@@ -34,14 +34,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--url", help="Starting URL to open before the task.")
     parser.add_argument("--name", help="Value to type into the Name field (demo mode).")
     parser.add_argument("--description", help="Value to type into the Description field (demo mode).")
-    parser.add_argument("--model", help="Gemini model id (default gemini-2.5-flash).")
+    parser.add_argument("--model", help="Claude model id (default claude-opus-4-8).")
     parser.add_argument("--max-steps", type=int, help="Safety cap on agent iterations.")
     parser.add_argument("--headless", dest="headless", action="store_true",
                         help="Run the browser without a visible window.")
     parser.add_argument("--no-headless", dest="headless", action="store_false",
                         help="Force a visible browser window.")
     parser.add_argument("--no-thinking", dest="thinking", action="store_false",
-                        help="Disable Gemini 2.5 thinking (faster).")
+                        help="Disable Claude adaptive thinking (faster, cheaper).")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Logging verbosity (default INFO).")
     parser.set_defaults(headless=None, thinking=None)
@@ -111,7 +111,7 @@ def main() -> int:
         logger.info('Desc.  : "%s"', config.description_value)
 
     if not config.api_key:
-        logger.error("GEMINI_API_KEY is not set. Copy .env.example to .env and add your key.")
+        logger.error("ANTHROPIC_API_KEY is not set. Copy .env.example to .env and add your key.")
         return 2
 
     agent = WebAutomationAgent(config, logger)

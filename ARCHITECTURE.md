@@ -20,9 +20,9 @@ The system separates **decision-making** from **actuation**:
 
 | Layer | Component | Responsibility |
 | --- | --- | --- |
-| Brain | `WebAutomationAgent` (`agent/agent.py`) | Runs the agentic loop, calls Gemini, interprets function calls, manages the conversation. |
+| Brain | `WebAutomationAgent` (`agent/agent.py`) | Runs the agentic loop, calls Claude, interprets tool calls, manages the conversation. |
 | Hands | `BrowserController` (`agent/browser_tools.py`) | Performs concrete browser actions via Playwright. |
-| Contract | `tools_schema.py` | The function declarations + prompts that connect the two. |
+| Contract | `tools_schema.py` | The tool definitions + prompts that connect the two. |
 | Config / IO | `config.py`, `logger.py`, `main.py` | Settings, logging, CLI. |
 
 This separation keeps each piece small and independently testable, and means the
@@ -46,23 +46,28 @@ DOM selectors. Reasons:
 
 The trade-off — coordinate clicks must be accurate — is mitigated by (a) locking
 `device_scale_factor=1` and a fixed `1280×800` viewport so screenshot pixels map
-1:1 to click coordinates, and (b) using Gemini 2.5's "thinking" so the model
-reasons about where the target's center is before clicking.
+1:1 to click coordinates, and (b) using Claude's **adaptive thinking** so the
+model reasons about where the target's center is before clicking.
 
-### Why Gemini?
+### Why Claude?
 
-`gemini-2.5-flash` combines **vision**, **function calling**, and **thinking** in
-a single model on a **free tier**, which is exactly what this agent needs. The
-brain is built on the `google-genai` SDK (`genai.Client(...).models.generate_content`).
+`claude-opus-4-8` combines **vision**, **tool use**, and **adaptive thinking** in
+a single model, which is exactly what this agent needs. The brain is built on the
+official `anthropic` SDK (`anthropic.Anthropic(...).messages.create`). The model
+is swappable within Anthropic (`--model claude-sonnet-4-6` for lower cost), but
+the provider is pinned: only `agent.py` and the schema format in
+`tools_schema.py` would change to move to a different vision LLM.
 
 ---
 
 ## 3. The tool surface
 
-Each function maps 1:1 to a `BrowserController` method and is declared to Gemini
-in `tools_schema.py` using its function-calling schema (OpenAPI subset). The
-declarations are deliberately **prescriptive about *when* to call** each tool,
-which improves tool-selection accuracy.
+Each tool maps 1:1 to a `BrowserController` method and is declared to Claude in
+`tools_schema.py` as a `{name, description, input_schema}` object — `input_schema`
+is plain JSON Schema. The descriptions are deliberately **prescriptive about
+*when* to call** each tool, which improves tool-selection accuracy (recent Claude
+models reach for tools conservatively, so a clear "call this when…" trigger
+helps).
 
 ```
 take_screenshot   navigate_to_url   click_on_screen   double_click
@@ -80,57 +85,63 @@ job done and end the loop.
 ### Visual feedback after every action
 
 The key mechanism: **after each action, the agent sends the result back as a
-`functionResponse` part *plus a fresh screenshot* (an inline image part) in the
-same user turn.** Gemini's function responses carry structured JSON (not images),
-so the screenshot is attached as a separate image part alongside the response.
-This gives the model an immediate look at the new page state so it can verify its
-last action before deciding the next one. This tight perceive→act→perceive loop
-is what makes the vision approach work.
+`tool_result` block that contains BOTH the result text AND a fresh screenshot
+(an image content block) in the same user turn.** Anthropic's `tool_result`
+blocks accept a list of content blocks — including images — so the screenshot
+travels *inside* the tool result rather than as a separate part. This gives the
+model an immediate look at the new page state so it can verify its last action
+before deciding the next one. This tight perceive→act→perceive loop is what makes
+the vision approach work.
+
+To enforce one screenshot per action, the request sets
+`tool_choice={"type": "auto", "disable_parallel_tool_use": True}`, so Claude
+calls at most one tool per turn.
 
 ---
 
 ## 4. The agent loop
 
-Implemented in `WebAutomationAgent.run()` as a *manual function-calling loop* (we
-own the loop so we can log everything and attach screenshots; **automatic function
-calling is disabled** because it would invoke our functions without giving the
-model a fresh screenshot in between):
+Implemented in `WebAutomationAgent.run()` as a *manual tool-use loop* (we own the
+loop so we can log everything and attach screenshots; we do **not** use the SDK's
+automatic tool runner, which would call our functions without giving the model a
+fresh screenshot in between):
 
 ```
 open_browser()                      # harness
 navigate_to_url(target)             # harness
 screenshot ──┐
              ▼
-   ┌──> contents = [ user: task text + first screenshot ]
+   ┌──> messages = [ user: task text + first screenshot (image block) ]
    │
    │   loop (bounded by max_steps):
-   │     response = client.models.generate_content(model, contents, config)
-   │     log thought summaries / text / token usage
-   │     model_content = response.candidates[0].content
-   │     contents.append(model_content)          # preserves thought signatures
-   │     function_calls = [parts with .function_call]
-   │     if none:  break                          # model replied with text only
-   │     for each function_call:
+   │     response = client.messages.create(model, system, tools, messages, thinking, ...)
+   │     log thinking summaries / text / token usage
+   │     messages.append({role: "assistant", content: response.content})  # preserves thinking blocks
+   │     if response.stop_reason == "refusal":  break
+   │     tool_uses = [blocks where .type == "tool_use"]
+   │     if none:  break                         # model replied with text only
+   │     for each tool_use:
    │        result_text, screenshot = execute via BrowserController
-   │        add functionResponse(name, {"output": result_text})
-   │        add image part (screenshot)
+   │        tool_results.append( tool_result(tool_use_id, [ text, image ]) )
    │        if report_task_complete: mark finished
-   │     contents.append( user: [functionResponses...] + [screenshots...] )
+   │     messages.append({role: "user", content: tool_results})
    └─    if finished: break
 close()                             # always, in finally
 ```
 
 Design points:
 
-- **Full transcript is replayed each turn** (the API is stateless). The model
-  `Content` — including any **thought** parts/signatures — is appended verbatim,
-  which Gemini uses to keep its reasoning coherent across function-calling turns.
-- **Thinking** is configured via `types.ThinkingConfig(include_thoughts=True,
-  thinking_budget=-1)` on the `2.5` family (`-1` = let the model decide;
-  `--no-thinking` sets it to `0`). `include_thoughts` surfaces a summary we log.
-- **Function responses first, screenshots after.** All `functionResponse` parts
-  are grouped ahead of the image parts in the reply turn, which keeps Gemini's
-  call↔response matching unambiguous when more than one call is returned.
+- **Full transcript is replayed each turn** (the API is stateless). The assistant
+  `content` — including any **thinking** blocks — is appended verbatim, which
+  Claude uses to keep its reasoning coherent across tool-use turns. (Modifying a
+  thinking block would be rejected; we pass them back unchanged.)
+- **Thinking** is configured via `thinking={"type": "adaptive", "display":
+  "summarized"}`. Adaptive lets the model decide how much to think;
+  `"summarized"` surfaces a readable summary we log (the raw chain of thought is
+  never returned). `--no-thinking` omits the parameter entirely.
+- **Every `tool_use` is answered.** Each assistant turn that contains a `tool_use`
+  is followed by a single user turn carrying a matching `tool_result` (text +
+  screenshot) for every call — the API requires this pairing.
 - **Bounded loop.** `max_steps` (default 25) guarantees termination even if the
   model never calls `report_task_complete`.
 
@@ -138,7 +149,7 @@ Design points:
 
 ## 5. Element detection & "intelligence"
 
-Element identification is **visual recognition by the model**: Gemini locates the
+Element identification is **visual recognition by the model**: Claude locates the
 Name/Description fields in the screenshot and emits the pixel coordinates to
 click. The agent demonstrates decision-making by:
 
@@ -179,22 +190,26 @@ Handled at several layers:
   a `networkidle` timeout (common on chatty SPAs) and continues once the DOM is
   ready.
 - **Tool layer.** A failed tool is caught, logged, and returned to the model as a
-  `functionResponse` whose output is the error message, plus a current screenshot
-  — so the model can adapt instead of the run aborting.
-- **Loop layer.** The whole run is wrapped in try/except for
-  `google.genai.errors.APIError`, `BrowserError`, and any unexpected exception;
-  the browser is always closed in a `finally`. A `max_steps` cap prevents
-  infinite loops. Empty/blocked responses (no candidates) are detected and end the
-  run cleanly.
+  `tool_result` whose text is the error message, plus a current screenshot — so
+  the model can adapt instead of the run aborting.
+- **Loop layer.** The whole run is wrapped in try/except for `anthropic.APIError`,
+  `BrowserError`, and any unexpected exception; the browser is always closed in a
+  `finally`. A `max_steps` cap prevents infinite loops. Refusals
+  (`stop_reason == "refusal"`) and text-only replies are detected and end the run
+  cleanly.
+- **API-key rotation.** On a rate-limit (429) or auth (401/403) error, the agent
+  rotates to the next configured key (`ANTHROPIC_API_KEY_2`, …) and retries the
+  same request; if all keys are exhausted, the error propagates. (The SDK already
+  retries transient 429/5xx with backoff before we ever rotate.)
 
 ---
 
 ## 7. Logging & observability
 
 `logger.py` configures one logger that writes to the console (watch it live) and
-to `logs/agent_<timestamp>.log` (audit later). It records the model's thought
-summaries and text, every function call with arguments, every screenshot path,
-token usage (at `DEBUG`: prompt/output/thoughts token counts), and a final result
+to `logs/agent_<timestamp>.log` (audit later). It records the model's thinking
+summaries and text, every tool call with arguments, every screenshot path, token
+usage (at `DEBUG`: input/output/cache-read token counts), and a final result
 block. Every screenshot is also saved under `screenshots/`, giving a
 frame-by-frame record of what the agent saw and did.
 
@@ -204,16 +219,18 @@ frame-by-frame record of what the agent saw and did.
 
 `config.py` provides a single typed `Config` dataclass populated from environment
 variables (via `.env`) with defaults, then overridable by CLI flags in `main.py`.
-The API key is read from `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) and never
-hard-coded. This keeps secrets and tunables (model, thinking, viewport, timeouts,
-values to type, step limit) out of the code.
+The API key is read from `ANTHROPIC_API_KEY` and never hard-coded. This keeps
+secrets and tunables (model, thinking, viewport, timeouts, values to type, step
+limit) out of the code.
 
 ---
 
 ## 9. Possible extensions
 
 - **Grid/element overlays** on screenshots to further improve click precision.
-- **Context pruning** of old screenshots for very long tasks (to limit tokens and
-  stay within free-tier limits).
+- **Prompt caching** of the system prompt and tool definitions to cut cost on
+  long runs (the stable prefix is identical every turn).
+- **Context editing** to prune old screenshots/tool results for very long tasks
+  (to limit tokens and cost).
 - **DOM-assisted hybrid mode**: feed the accessibility tree alongside the image
   for tasks where text labels are more reliable than pixels.

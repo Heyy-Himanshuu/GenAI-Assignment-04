@@ -29,9 +29,9 @@ def _get_bool(name: str, default: bool) -> bool:
 class Config:
     """Runtime configuration for a single agent run."""
 
-    # --- Gemini / model ---
+    # --- Claude / model ---
     # api_key is the first/primary key (kept for back-compat and the startup
-    # check); api_keys is the full rotation pool used on quota errors.
+    # check); api_keys is the full rotation pool used on rate-limit/auth errors.
     api_key: str | None
     api_keys: list[str]
     model: str
@@ -62,29 +62,28 @@ class Config:
 
 
 def _collect_api_keys() -> list[str]:
-    """Gather every configured Gemini key into an ordered, de-duplicated list.
+    """Gather every configured Anthropic key into an ordered, de-duplicated list.
 
-    Reads GEMINI_API_KEY, GEMINI_API_KEY_2..5, a comma-separated GEMINI_API_KEYS,
-    and GOOGLE_API_KEY. The agent tries them in order, rotating to the next one
-    when a key hits its quota (HTTP 429) or is denied (403). The unedited
-    ``AIza...`` placeholder from .env.example is ignored.
+    Reads ANTHROPIC_API_KEY, ANTHROPIC_API_KEY_2..5, and a comma-separated
+    ANTHROPIC_API_KEYS. The agent tries them in order, rotating to the next one
+    when a key is rate-limited (HTTP 429) or rejected (401/403). The unedited
+    ``sk-ant-...`` placeholder from .env.example is ignored.
     """
     candidates: list[str] = []
     for name in (
-        "GEMINI_API_KEY",
-        "GEMINI_API_KEY_2",
-        "GEMINI_API_KEY_3",
-        "GEMINI_API_KEY_4",
-        "GEMINI_API_KEY_5",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_API_KEY_2",
+        "ANTHROPIC_API_KEY_3",
+        "ANTHROPIC_API_KEY_4",
+        "ANTHROPIC_API_KEY_5",
     ):
         candidates.append(os.getenv(name) or "")
-    candidates.extend((os.getenv("GEMINI_API_KEYS") or "").split(","))
-    candidates.append(os.getenv("GOOGLE_API_KEY") or "")
+    candidates.extend((os.getenv("ANTHROPIC_API_KEYS") or "").split(","))
 
     keys: list[str] = []
     for raw in candidates:
         key = raw.strip()
-        if key and key != "AIza..." and key not in keys:
+        if key and key != "sk-ant-..." and key not in keys:
             keys.append(key)
     return keys
 
@@ -93,12 +92,12 @@ def load_config() -> Config:
     """Build a :class:`Config` from environment variables (with defaults)."""
     api_keys = _collect_api_keys()
     return Config(
-        # First key is primary; the rest are fallbacks used on quota/denied errors.
+        # First key is primary; the rest are fallbacks used on rate-limit/auth errors.
         api_key=api_keys[0] if api_keys else None,
         api_keys=api_keys,
-        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        model=os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8"),
         enable_thinking=_get_bool("ENABLE_THINKING", True),
-        max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "8192")),
+        max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "16000")),
         task=os.getenv("TASK") or None,
         target_url=os.getenv(
             "TARGET_URL", "https://ui.shadcn.com/docs/forms/react-hook-form"
@@ -106,7 +105,7 @@ def load_config() -> Config:
         name_value=os.getenv("FORM_NAME_VALUE", "Jane Doe"),
         description_value=os.getenv(
             "FORM_DESCRIPTION_VALUE",
-            "This form was filled automatically by a Gemini-powered vision "
+            "This form was filled automatically by a Claude-powered vision "
             "agent using Playwright.",
         ),
         headless=_get_bool("HEADLESS", False),

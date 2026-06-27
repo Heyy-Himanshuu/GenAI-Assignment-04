@@ -1,29 +1,29 @@
-"""The Gemini-driven agent loop (the agent's "brain").
+"""The Claude-driven agent loop (the agent's "brain").
 
 ``WebAutomationAgent`` opens the page, then repeatedly:
 
-  1. sends the conversation (instructions + screenshots) to Gemini,
-  2. reads the function call Gemini decides to make,
+  1. sends the conversation (instructions + screenshots) to Claude,
+  2. reads the tool call Claude decides to make,
   3. executes it against the :class:`BrowserController`,
-  4. feeds the result back as a ``functionResponse`` part PLUS a fresh screenshot,
+  4. feeds the result back as a ``tool_result`` block that carries BOTH the
+     result text AND a fresh screenshot,
 
-until Gemini calls ``report_task_complete`` or a safety step-limit is hit.
+until Claude calls ``report_task_complete`` or a safety step-limit is hit.
 
-This is a *manual* function-calling loop: we keep full control so every decision
-and action is logged, and so we can attach a screenshot after each action — the
-visual feedback that makes the vision approach work. (Automatic function calling
-is disabled because it would call our functions without giving the model a
-fresh screenshot in between.)
+This is a *manual* tool-use loop: we keep full control so every decision and
+action is logged, and so we can attach a screenshot after each action — the
+visual feedback that makes the vision approach work. (We do not use the SDK's
+automatic tool runner because it would call our functions without giving the
+model a fresh screenshot in between.)
 """
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 from logging import Logger
 
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types
+import anthropic
 
 from agent.browser_tools import BrowserController, BrowserError
 from agent.tools_schema import (
@@ -47,23 +47,35 @@ class RunResult:
     steps_taken: int
 
 
+def _image_block(png_bytes: bytes) -> dict:
+    """Wrap raw PNG bytes as an Anthropic base64 image content block."""
+    data = base64.standard_b64encode(png_bytes).decode("utf-8")
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": data},
+    }
+
+
 class WebAutomationAgent:
-    """Drives a browser to complete a task using Gemini's vision + function calling."""
+    """Drives a browser to complete a task using Claude's vision + tool use."""
 
     def __init__(self, config: Config, logger: Logger) -> None:
         if not config.api_keys:
             raise ValueError(
-                "No Gemini API key is set. Add GEMINI_API_KEY to your .env file or "
-                "environment before running the agent."
+                "No Anthropic API key is set. Add ANTHROPIC_API_KEY to your .env "
+                "file or environment before running the agent."
             )
         self.config = config
         self.log = logger
-        # Rotation pool: start on the first key, advance to the next on a quota
-        # (429) or denied (403) error so a single exhausted key doesn't stop a run.
+        # Rotation pool: start on the first key, advance to the next on a
+        # rate-limit (429) or auth (401/403) error so a single exhausted/limited
+        # key doesn't stop a run.
         self.api_keys = config.api_keys
         self._key_index = 0
-        self.client = genai.Client(api_key=self.api_keys[0])
-        self.tool = types.Tool(function_declarations=FUNCTION_DECLARATIONS)
+        self.client = anthropic.Anthropic(api_key=self.api_keys[0])
+        # Anthropic takes the tool list verbatim — each entry is already a
+        # {name, description, input_schema} dict.
+        self.tools = FUNCTION_DECLARATIONS
         self.controller = BrowserController(config, logger)
         self.system_prompt = build_system_prompt(
             config.viewport_width, config.viewport_height
@@ -92,70 +104,69 @@ class WebAutomationAgent:
                     self.config.description_value,
                 )
 
-            # The conversation history (list of types.Content). It starts with the
+            # The conversation history (list of message dicts). It starts with the
             # task description and the first screenshot.
-            contents: list[types.Content] = [
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_text(text=task_text),
-                        types.Part.from_bytes(data=screenshot, mime_type="image/png"),
+            messages: list[dict] = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": task_text},
+                        _image_block(screenshot),
                     ],
-                )
+                }
             ]
 
             for step in range(1, self.config.max_steps + 1):
                 result.steps_taken = step
                 self.log.info("──── step %d/%d ────", step, self.config.max_steps)
 
-                response = self._generate(contents)
+                response = self._generate(messages)
                 self._log_model_output(response)
 
-                model_content = self._model_content(response)
-                if model_content is None:
-                    self.log.warning("Model returned no content (possibly blocked).")
-                    result.summary = "Model returned no content."
+                # Record the assistant turn verbatim. Passing the response content
+                # blocks back unchanged preserves any thinking blocks, which Claude
+                # uses to keep its reasoning coherent across tool-use turns.
+                messages.append({"role": "assistant", "content": response.content})
+
+                if response.stop_reason == "refusal":
+                    self.log.warning("Model declined the request (refusal).")
+                    result.summary = "Model refused the request."
                     break
 
-                # Record the model turn verbatim (preserves thought signatures).
-                contents.append(model_content)
+                tool_uses = [b for b in response.content if b.type == "tool_use"]
 
-                function_calls = [
-                    p.function_call
-                    for p in (model_content.parts or [])
-                    if getattr(p, "function_call", None)
-                ]
-
-                if not function_calls:
-                    # Model replied with text instead of a function call — nothing
-                    # left to do (or it is asking a question). End the loop.
-                    self.log.info("Model ended turn without a function call.")
-                    result.summary = self._first_text(model_content) or (
-                        "Model stopped without a function call."
+                if not tool_uses:
+                    # Model replied with text instead of a tool call — nothing left
+                    # to do (or it is asking a question). End the loop.
+                    self.log.info("Model ended turn without a tool call.")
+                    result.summary = self._first_text(response.content) or (
+                        "Model stopped without a tool call."
                     )
                     break
 
-                # Execute each requested function and build the reply turn.
-                fr_parts: list[types.Part] = []   # functionResponse parts (first)
-                img_parts: list[types.Part] = []   # screenshot parts (after)
+                # Execute each requested tool and build the reply turn. Every
+                # tool_result carries the result text plus a fresh screenshot, so
+                # Claude sees the new page state for its next decision.
+                tool_results: list[dict] = []
                 finished = False
-                for fc in function_calls:
-                    text, screenshot, done, outcome = self._execute_tool(fc)
-                    fr_parts.append(
-                        types.Part.from_function_response(
-                            name=fc.name, response={"output": text}
-                        )
-                    )
+                for tu in tool_uses:
+                    text, screenshot, done, outcome = self._execute_tool(tu)
+                    content: list[dict] = [{"type": "text", "text": text}]
                     if screenshot is not None:
-                        img_parts.append(
-                            types.Part.from_bytes(data=screenshot, mime_type="image/png")
-                        )
+                        content.append(_image_block(screenshot))
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "content": content,
+                        }
+                    )
                     if done:
                         finished = True
                         result.success = outcome.success
                         result.summary = outcome.summary
 
-                contents.append(types.Content(role="user", parts=fr_parts + img_parts))
+                messages.append({"role": "user", "content": tool_results})
 
                 if finished:
                     self.log.info(
@@ -169,8 +180,8 @@ class WebAutomationAgent:
                 )
                 result.summary = "Step limit reached before the task was reported complete."
 
-        except genai_errors.APIError as exc:
-            self.log.error("Gemini API error: %s", exc)
+        except anthropic.APIError as exc:
+            self.log.error("Claude API error: %s", exc)
             result.summary = f"API error: {exc}"
         except BrowserError as exc:
             self.log.error("Browser error: %s", exc)
@@ -186,38 +197,33 @@ class WebAutomationAgent:
     # ------------------------------------------------------------------ #
     # Model call
     # ------------------------------------------------------------------ #
-    def _generate(self, contents: list[types.Content]):
-        """Call ``generate_content`` with vision + function-calling config."""
-        cfg_kwargs: dict = {
-            "system_instruction": self.system_prompt,
-            "tools": [self.tool],
-            "max_output_tokens": self.config.max_output_tokens,
-            # Manual loop: we resolve function calls ourselves so we can attach a
-            # screenshot to each result.
-            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
-                disable=True
-            ),
+    def _generate(self, messages: list[dict]):
+        """Call ``messages.create`` with vision + tool-use config."""
+        kwargs: dict = {
+            "model": self.config.model,
+            "max_tokens": self.config.max_output_tokens,
+            "system": self.system_prompt,
+            "tools": self.tools,
+            # One tool per turn, so each action gets its own screenshot before the
+            # model decides the next step (the perceive→act→perceive loop).
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
+            "messages": messages,
         }
-        # "Thinking" is only available on Gemini 2.5 models. include_thoughts
-        # surfaces a summary we can log; thinking_budget=-1 lets the model decide
-        # how much to think (0 would disable it on Flash).
-        if "2.5" in self.config.model:
-            cfg_kwargs["thinking_config"] = types.ThinkingConfig(
-                include_thoughts=self.config.enable_thinking,
-                thinking_budget=(-1 if self.config.enable_thinking else 0),
-            )
+        # Adaptive thinking lets Claude decide how much to reason before acting,
+        # which improves coordinate accuracy. display="summarized" surfaces a
+        # readable summary we log (the raw chain of thought is never returned).
+        # --no-thinking omits the parameter entirely (faster, cheaper).
+        if self.config.enable_thinking:
+            kwargs["thinking"] = {"type": "adaptive", "display": "summarized"}
 
-        cfg = types.GenerateContentConfig(**cfg_kwargs)
-        # Try the current key; on quota (429) / denied (403), rotate to the next
-        # key and retry the same request. Other errors propagate immediately.
+        # Try the current key; on rate-limit (429) / auth (401/403), rotate to the
+        # next key and retry the same request. Other errors propagate immediately.
         while True:
             try:
-                return self.client.models.generate_content(
-                    model=self.config.model, contents=contents, config=cfg
-                )
-            except genai_errors.APIError as exc:
-                code = getattr(exc, "code", None)
-                if code in (429, 403):
+                return self.client.messages.create(**kwargs)
+            except anthropic.APIStatusError as exc:
+                code = getattr(exc, "status_code", None)
+                if code in (429, 401, 403):
                     self.log.warning(
                         "API key #%d/%d failed (HTTP %s): %s",
                         self._key_index + 1, len(self.api_keys), code,
@@ -237,20 +243,20 @@ class WebAutomationAgent:
         if self._key_index + 1 >= len(self.api_keys):
             return False
         self._key_index += 1
-        self.client = genai.Client(api_key=self.api_keys[self._key_index])
+        self.client = anthropic.Anthropic(api_key=self.api_keys[self._key_index])
         return True
 
     # ------------------------------------------------------------------ #
     # Tool execution
     # ------------------------------------------------------------------ #
-    def _execute_tool(self, function_call):
-        """Run one function call.
+    def _execute_tool(self, tool_use):
+        """Run one tool call.
 
         Returns ``(result_text, screenshot_bytes_or_None, finished, outcome)``
         where ``finished`` is True only for ``report_task_complete``.
         """
-        name = function_call.name
-        args = dict(function_call.args or {})
+        name = tool_use.name
+        args = dict(tool_use.input or {})
         self.log.info("→ tool: %s %s", name, args)
 
         # report_task_complete ends the run and carries no screenshot — but only
@@ -295,7 +301,7 @@ class WebAutomationAgent:
             return f"Error: {exc}", screenshot, False, None
 
     def _dispatch_browser_tool(self, name: str, args: dict) -> tuple[str, bytes]:
-        """Map a function name to a BrowserController call; return (text, screenshot)."""
+        """Map a tool name to a BrowserController call; return (text, screenshot)."""
         if name == "take_screenshot":
             _, png = self.controller.take_screenshot("requested")
             return "Screenshot captured.", png
@@ -365,41 +371,31 @@ class WebAutomationAgent:
     # ------------------------------------------------------------------ #
     # Small helpers
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _model_content(response):
-        """Return the model's ``Content`` from a response, or None if absent."""
-        candidates = getattr(response, "candidates", None)
-        if not candidates:
-            return None
-        return candidates[0].content
-
     def _log_model_output(self, response) -> None:
-        """Log thought summaries / text and token usage from a model response."""
-        content = self._model_content(response)
-        if content is not None:
-            for part in content.parts or []:
-                text = getattr(part, "text", None)
-                if not text:
-                    continue
-                if getattr(part, "thought", False):
-                    self.log.info("[thinking] %s", _truncate(text))
-                else:
-                    self.log.info("[assistant] %s", _truncate(text))
-        usage = getattr(response, "usage_metadata", None)
+        """Log thinking summaries / text and token usage from a model response."""
+        for block in response.content or []:
+            btype = getattr(block, "type", None)
+            if btype == "thinking":
+                thought = getattr(block, "thinking", "")
+                if thought:
+                    self.log.info("[thinking] %s", _truncate(thought))
+            elif btype == "text":
+                if block.text:
+                    self.log.info("[assistant] %s", _truncate(block.text))
+        usage = getattr(response, "usage", None)
         if usage is not None:
             self.log.debug(
-                "tokens prompt=%s output=%s thoughts=%s",
-                getattr(usage, "prompt_token_count", "?"),
-                getattr(usage, "candidates_token_count", "?"),
-                getattr(usage, "thoughts_token_count", "?"),
+                "tokens input=%s output=%s cache_read=%s",
+                getattr(usage, "input_tokens", "?"),
+                getattr(usage, "output_tokens", "?"),
+                getattr(usage, "cache_read_input_tokens", "?"),
             )
 
     @staticmethod
     def _first_text(content) -> str:
-        for part in content.parts or []:
-            text = getattr(part, "text", None)
-            if text and not getattr(part, "thought", False):
-                return text
+        for block in content or []:
+            if getattr(block, "type", None) == "text" and block.text:
+                return block.text
         return ""
 
 
